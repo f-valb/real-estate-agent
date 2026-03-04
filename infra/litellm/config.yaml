@@ -1,0 +1,17 @@
+model_list:
+  - model_name: "qwen2.5:14b"
+    litellm_params:
+      model: "ollama/qwen2.5:14b"
+      api_base: "http://ollama:11434"
+
+  - model_name: "qwen2.5:7b"
+    litellm_params:
+      model: "ollama/qwen2.5:7b"
+      api_base: "http://ollama:11434"
+
+general_settings:
+  master_key: "sk-litellm-dev-key"
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false

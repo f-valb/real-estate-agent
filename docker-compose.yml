@@ -1,0 +1,268 @@
+x-python-service: &python-service
+  restart: on-failure
+  networks:
+    - re-network
+
+services:
+  # ============================================================
+  # Infrastructure
+  # ============================================================
+
+  postgres:
+    image: postgres:16-alpine
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: realestate
+      POSTGRES_PASSWORD: realestate
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U realestate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [re-network]
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes: [zk_data:/var/lib/zookeeper/data]
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [re-network]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports: ["9093:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes: [kafka_data:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks: [re-network]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [re-network]
+
+  # ============================================================
+  # AI Infrastructure (Ollama + LiteLLM)
+  # ============================================================
+
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: [ollama_data:/root/.ollama]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [re-network]
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    ports: ["4000:4000"]
+    volumes:
+      - ./infra/litellm/config.yaml:/app/config.yaml
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: sk-litellm-dev-key
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [re-network]
+
+  # ============================================================
+  # Microservices
+  # ============================================================
+
+  property-listing:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: services/property-listing/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://realestate:realestate@postgres:5432/db_listings
+      KAFKA_BOOTSTRAP: kafka:29092
+      SERVICE_NAME: property-listing
+    ports: ["8000:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  crm-contact:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: services/crm-contact/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://realestate:realestate@postgres:5432/db_crm
+      KAFKA_BOOTSTRAP: kafka:29092
+      SERVICE_NAME: crm-contact
+    ports: ["8001:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  market-data:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: services/market-data/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://realestate:realestate@postgres:5432/db_market
+      KAFKA_BOOTSTRAP: kafka:29092
+      SERVICE_NAME: market-data
+    ports: ["8002:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ============================================================
+  # AI Agents
+  # ============================================================
+
+  pricing-strategy:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: agents/pricing-strategy/Dockerfile
+    environment:
+      PROPERTY_SERVICE_URL: http://property-listing:8000
+      MARKET_SERVICE_URL: http://market-data:8000
+      LITELLM_URL: http://litellm:4000/v1
+      LLM_MODEL: qwen2.5:14b
+      KAFKA_BOOTSTRAP: kafka:29092
+      SERVICE_NAME: pricing-strategy
+    ports: ["8010:8000"]
+    depends_on:
+      property-listing:
+        condition: service_started
+      market-data:
+        condition: service_started
+      litellm:
+        condition: service_healthy
+
+  lead-intelligence:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: agents/lead-intelligence/Dockerfile
+    environment:
+      CRM_SERVICE_URL: http://crm-contact:8000
+      PROPERTY_SERVICE_URL: http://property-listing:8000
+      MARKET_SERVICE_URL: http://market-data:8000
+      LITELLM_URL: http://litellm:4000/v1
+      LLM_MODEL: qwen2.5:14b
+      KAFKA_BOOTSTRAP: kafka:29092
+      SERVICE_NAME: lead-intelligence
+    ports: ["8011:8000"]
+    depends_on:
+      crm-contact:
+        condition: service_started
+      property-listing:
+        condition: service_started
+      litellm:
+        condition: service_healthy
+
+  home-finder:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: agents/home-finder/Dockerfile
+    environment:
+      PROPERTY_SERVICE_URL: http://property-listing:8000
+      LITELLM_URL: http://litellm:4000/v1
+      LLM_MODEL: qwen2.5:14b
+      SERVICE_NAME: home-finder
+    ports: ["8012:8000"]
+    depends_on:
+      property-listing:
+        condition: service_started
+      litellm:
+        condition: service_healthy
+
+  # ============================================================
+  # API Gateway
+  # ============================================================
+
+  gateway:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports: ["8090:8000"]
+    environment:
+      PROPERTY_SERVICE_URL: http://property-listing:8000
+      CRM_SERVICE_URL: http://crm-contact:8000
+      MARKET_SERVICE_URL: http://market-data:8000
+      PRICING_AGENT_URL: http://pricing-strategy:8000
+      LEAD_AGENT_URL: http://lead-intelligence:8000
+      HOME_FINDER_URL: http://home-finder:8000
+      REDIS_URL: redis://redis:6379
+      SERVICE_NAME: gateway
+    depends_on:
+      property-listing:
+        condition: service_started
+      crm-contact:
+        condition: service_started
+      market-data:
+        condition: service_started
+      pricing-strategy:
+        condition: service_started
+      lead-intelligence:
+        condition: service_started
+      home-finder:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  kafka_data:
+  zk_data:
+  redis_data:
+  ollama_data:
+
+networks:
+  re-network:
+    driver: bridge
