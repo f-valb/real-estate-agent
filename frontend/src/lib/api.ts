@@ -21,6 +21,8 @@ import type {
   PricingRecommendation,
   LeadAssessment,
   HomefinderResult,
+  ChatMessage,
+  ChatStepResponse,
 } from "./types";
 
 export const getListings = (params?: Record<string, string>) => {
@@ -55,4 +57,10 @@ export const findHomes = (description: string) =>
   fetchJSON<HomefinderResult>("/api/v1/agents/home-finder/search", {
     method: "POST",
     body: JSON.stringify({ description }),
+  });
+
+export const chatHomeFinder = (messages: Omit<ChatMessage, "thought">[]) =>
+  fetchJSON<ChatStepResponse>("/api/v1/agents/home-finder/chat", {
+    method: "POST",
+    body: JSON.stringify({ messages }),
   });

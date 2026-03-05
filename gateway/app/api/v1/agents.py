@@ -43,3 +43,8 @@ async def lead_score(request: Request):
 @router.post("/home-finder/search")
 async def home_finder_search(request: Request):
     return await _proxy_agent(request, "HOME_FINDER_URL", "/api/v1/home-finder/search")
+
+
+@router.post("/home-finder/chat")
+async def home_finder_chat(request: Request):
+    return await _proxy_agent(request, "HOME_FINDER_URL", "/api/v1/home-finder/chat")

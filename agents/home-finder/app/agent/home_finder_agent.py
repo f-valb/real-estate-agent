@@ -7,7 +7,7 @@ import re
 
 from openai import AsyncOpenAI, APIConnectionError
 
-from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.prompts import SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT
 from app.agent.tools import TOOL_DEFINITIONS, ToolExecutor
 from app.guardrails.validators import HomefinderResult, validate_result
 
@@ -192,6 +192,89 @@ async def _heuristic_search(description: str, tool_executor: ToolExecutor) -> di
         "matched_listing_ids": matched_ids,
         "total_found": len(matched_ids),
         "search_params_used": params,
+    }
+
+
+GUIDED_QUESTIONS = [
+    "Where are you hoping to live? Any particular city, neighbourhood, or area in mind?",
+    "What's your rough budget? For example, 'under $500k' or 'around $400–600k'.",
+    "How many bedrooms do you need? And do you have any must-haves — like a yard, garage, or home office?",
+    "Are you thinking house, condo, or townhouse? Any other priorities — good schools, short commute, quiet street?",
+]
+
+
+async def chat_step(
+    messages: list[dict],
+    llm_client: AsyncOpenAI,
+    tool_executor: ToolExecutor,
+    llm_model: str,
+) -> dict:
+    """One conversational turn: either ask a follow-up question or trigger a search.
+
+    Returns one of:
+      {"action": "question", "thought": str, "question": str}
+      {"action": "results",  "thought": str, "result": dict}
+    """
+    try:
+        llm_messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + messages
+        response = await llm_client.chat.completions.create(
+            model=llm_model,
+            messages=llm_messages,
+            max_tokens=1024,
+            temperature=0.3,
+        )
+        content = response.choices[0].message.content or ""
+        logger.debug("Chat LLM response: %s", content[:300])
+        parsed = _extract_json(content)
+
+        if parsed.get("action") == "search":
+            description = (
+                parsed.get("search_params", {}).get("description")
+                or " ".join(m["content"] for m in messages if m["role"] == "user")
+            )
+            thought = parsed.get("thought", "")
+            logger.info("Chat agent triggering search: %r", description[:100])
+            result = await find_homes(description, llm_client, tool_executor, llm_model)
+            return {"action": "results", "thought": thought, "result": result.model_dump()}
+
+        # action == "question"
+        return {
+            "action": "question",
+            "thought": parsed.get("thought", ""),
+            "question": parsed.get("question", "Could you tell me more about what you're looking for?"),
+        }
+
+    except Exception as e:
+        logger.warning("Chat LLM step failed (%s), using heuristic", e)
+        return await _heuristic_chat_step(messages, tool_executor)
+
+
+async def _heuristic_chat_step(messages: list[dict], tool_executor: ToolExecutor) -> dict:
+    """Fallback guided questions when LLM is unavailable."""
+    user_msgs = [m for m in messages if m["role"] == "user"]
+    n = len(user_msgs)
+
+    if n < len(GUIDED_QUESTIONS):
+        question = GUIDED_QUESTIONS[n]
+        return {
+            "action": "question",
+            "thought": f"Gathering context (exchange {n + 1} of {len(GUIDED_QUESTIONS)}). "
+                       f"Asked about: {['location', 'budget', 'bedrooms', 'type/lifestyle'][:n]}. "
+                       f"Now asking about {['location', 'budget', 'bedrooms', 'type/lifestyle'][n]}.",
+            "question": question,
+        }
+
+    # Enough context — build description from all user messages and search
+    combined = " ".join(m["content"] for m in user_msgs)
+    logger.info("Heuristic chat: enough context after %d exchanges, searching", n)
+    result_data = await _heuristic_search(combined, tool_executor)
+    result_data = await _attach_listings(result_data, tool_executor)
+    validated = validate_result(result_data)
+    return {
+        "action": "results",
+        "thought": f"Collected information across {n} exchanges. "
+                   f"Searching with combined description: {combined[:120]}...",
+        "result": validated.model_dump(),
     }
 
 

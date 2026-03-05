@@ -94,3 +94,13 @@ export interface HomefinderResult {
   matched_listings: PropertyResponse[];
   search_params_used: Record<string, unknown>;
 }
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  thought?: string;
+}
+
+export type ChatStepResponse =
+  | { action: "question"; thought: string; question: string }
+  | { action: "results"; thought: string; result: HomefinderResult };
